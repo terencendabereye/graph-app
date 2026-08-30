@@ -32,7 +32,7 @@ if ($LASTEXITCODE -eq 0) {
     Write-Host ""
     Write-Host "Build succeeded. Folder is at: dist\graph_app\" -ForegroundColor Green
     Write-Host "Run it with:  .\dist\graph_app\graph_app.exe" -ForegroundColor Green
-    Write-Host "Share it as:  $zipPath (self-contained, no install needed —" -ForegroundColor Green
+    Write-Host "Share it as:  $zipPath (self-contained, no install needed -" -ForegroundColor Green
     Write-Host "              unzip on the target PC and run graph_app.exe inside)" -ForegroundColor Green
 } else {
     Write-Host ""
