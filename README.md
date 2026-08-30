@@ -8,6 +8,9 @@ PNG/HTML export. Packaged as a self-contained Windows folder via PyInstaller
 so it can be shared without requiring Python (or admin rights to install
 anything) on the target machine.
 
+**Just want to use the app?** See [USER_GUIDE.md](USER_GUIDE.md) instead —
+this file is for building/developing it.
+
 ## Files
 
 | File | Purpose |
