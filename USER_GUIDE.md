@@ -26,10 +26,17 @@ internal tool, not a sign anything is wrong. Click **More info**, then
 
 ## Loading your data
 
-Use **Upload a CSV or Excel file** in the left sidebar. Once it loads, you'll
-see how many rows/columns came in.
+Use **Upload one or more CSV/Excel files** in the left sidebar. Once it
+loads, you'll see how many rows/columns came in.
 
 - **CSV or Excel (`.xlsx`/`.xls`)** both work.
+- **You can upload more than one file.** Drop in a second (or third...) file
+  and it's added to the list shown above the uploader, not swapped in for
+  the first — useful when a time range comes as separate exports (e.g. one
+  file per day). Their rows are combined and, since a Timestamp-type column
+  is auto-detected, sorted back into chronological order regardless of which
+  file you added first. Remove one with the **x** next to its name in that
+  list.
 - Any column that looks like a date or time — even if it's not *named*
   anything like "date" or "time" (SCADA exports often label a time column
   something generic) — is automatically detected, so it can drive the time
@@ -66,10 +73,25 @@ Everything here lives in the left sidebar.
   magnitude.
 - **Hover behavior** — how tooltips behave when you point at the chart, and
   whether crosshair guide lines follow your cursor.
-- **Reference markers** — add your own threshold lines: a row with type
-  **X** draws a vertical line at a given date/time or X value; type **Y**
-  draws a horizontal line at a given value, labeled against whichever
-  column you point it at.
+- **Reference markers** — add as many rows as you need, in any mix of
+  five types:
+  - **X** — a vertical dashed line at a given date/time or X value.
+  - **Y** — a horizontal dashed line at a given value on the column you
+    point it at.
+  - **X Range** — a shaded vertical band between two X values (put the
+    start in **Value**, the end in **Value 2**).
+  - **Y Range** — a shaded horizontal band between two Y values on a
+    given column — this is the one to use for a deadband: set **Value**
+    to the low edge, **Value 2** to the high edge, target the frequency
+    column, and give it a **Label** like "Deadband".
+  - **Point** — labels the actual trend point nearest an X value on a
+    chosen column's line (e.g. "Enters deadband" / "Exits deadband" at
+    the times the frequency crosses your band) — it snaps to the real
+    data sample, not just the number you typed.
+
+  **Label** is optional on every row — leave it blank for an
+  auto-generated one, or fill it in for something readable like "Enters
+  deadband".
 
 Each plotted series gets **its own Y axis**, automatically colored to match
 its line — so series with very different scales (say, a frequency in Hz next

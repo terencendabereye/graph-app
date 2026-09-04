@@ -18,11 +18,12 @@ st.title("Graphing app")
 # ---------------------------------------------------------------------------
 # 1. Data loading
 # ---------------------------------------------------------------------------
-uploaded_file = st.sidebar.file_uploader(
-    "Upload a CSV or Excel file", type=["csv", "xlsx", "xls"]
+uploaded_files = st.sidebar.file_uploader(
+    "Upload one or more CSV/Excel files", type=["csv", "xlsx", "xls"],
+    accept_multiple_files=True,
 )
 
-if uploaded_file is None:
+if not uploaded_files:
     st.info("Upload a CSV or Excel file from the sidebar to get started.")
     st.stop()
 
@@ -61,17 +62,42 @@ def load_data(file) -> pd.DataFrame:
 
 
 try:
-    raw_df = load_data(uploaded_file)
+    frames = [load_data(f) for f in uploaded_files]
 except Exception as e:
     st.error(f"Could not read file: {e}")
     st.stop()
 
-st.sidebar.success(f"Loaded {raw_df.shape[0]} rows x {raw_df.shape[1]} columns")
+if len(frames) == 1:
+    raw_df = frames[0]
+else:
+    # Multiple historian/SCADA exports for the same tags often arrive as
+    # separate files covering different time windows — concatenate rows
+    # rather than replacing, then sort by whichever column parsed as a
+    # datetime so the combined series stays chronological regardless of
+    # the order files were selected/dropped in.
+    col_sets = {frozenset(f.columns) for f in frames}
+    if len(col_sets) > 1:
+        st.sidebar.warning(
+            "Uploaded files don't all have the same columns — cells for a "
+            "column missing from a given file will show blank for those rows."
+        )
+    raw_df = pd.concat(frames, ignore_index=True, sort=False)
+    datetime_cols = raw_df.select_dtypes(include="datetime").columns
+    if len(datetime_cols) > 0:
+        raw_df = raw_df.sort_values(datetime_cols[0]).reset_index(drop=True)
 
-# Keep an editable copy in session state so renames/edits persist across reruns
-if "df" not in st.session_state or st.session_state.get("_source_file") != uploaded_file.name:
+st.sidebar.success(
+    f"Loaded {raw_df.shape[0]} rows x {raw_df.shape[1]} columns"
+    + (f" from {len(frames)} files" if len(frames) > 1 else "")
+)
+
+# Keep an editable copy in session state so renames/edits persist across
+# reruns. Keyed on the set of uploaded filenames (not just one name) so
+# adding/removing a file to the multi-file uploader is detected as a change.
+source_key = tuple(sorted(f.name for f in uploaded_files))
+if "df" not in st.session_state or st.session_state.get("_source_files") != source_key:
     st.session_state.df = raw_df.copy()
-    st.session_state["_source_file"] = uploaded_file.name
+    st.session_state["_source_files"] = source_key
 
 # ---------------------------------------------------------------------------
 # Edit data: rename columns, edit values
@@ -202,6 +228,8 @@ if supports_markers and "markers" in mode:
     )
 
 log_y = st.sidebar.toggle("Log scale (Y)", value=False)
+show_grid = st.sidebar.toggle("Show gridlines", value=True)
+show_cursor = st.sidebar.toggle("Show cursor", value=True)
 
 # ---------------------------------------------------------------------------
 # Every plotted Y column gets its own Y axis/scale (see the "Wire up Y axes"
@@ -238,9 +266,12 @@ show_spikes = st.sidebar.toggle("Show crosshair guide lines on hover", value=Fal
 # ---------------------------------------------------------------------------
 st.sidebar.subheader("Reference markers (optional)")
 st.sidebar.caption(
-    "Add vertical (X) or horizontal (Y) marker lines. X markers are read using the "
-    "X column's type (dates parsed as dates). Y markers are tied to a specific series "
-    "and labeled using that series' own formatting."
+    "X / Y: a single dashed line. X Range / Y Range: a shaded band between two values "
+    "(e.g. a deadband) — put the low value in Value and the high value in Value 2. "
+    "Point: labels the actual data point nearest Value (an X position) on Target "
+    "column's line. Label is optional for all types — leave blank for an auto label. "
+    "Color is optional too — leave it blank to use the type's default (red for X/X "
+    "Range, green for Y/Y Range, the series' own color for Point)."
 )
 
 if "marker_table" not in st.session_state:
@@ -249,24 +280,101 @@ if "marker_table" not in st.session_state:
             "type": pd.array([], dtype="string"),
             "target_column": pd.array([], dtype="string"),
             "value": pd.array([], dtype="string"),
+            "value2": pd.array([], dtype="string"),
+            "label": pd.array([], dtype="string"),
+            "color": pd.array([], dtype="string"),
         }
     )
 
+# Same principle as _sticky_range/_sticky_value below: st.session_state.marker_table
+# is seeded once and never reassigned. A data_editor with key="marker_editor" already
+# persists its own edits across reruns internally; feeding its edited output back in
+# as next rerun's `data=` (an earlier version of this did) fights that internal diff
+# tracking, so a freshly typed cell got reverted and needed to be entered twice before
+# it stuck.
 marker_table = st.sidebar.data_editor(
     st.session_state.marker_table,
     num_rows="dynamic",
     key="marker_editor",
     column_config={
-        "type": st.column_config.SelectboxColumn("Type", options=["X", "Y"]),
+        "type": st.column_config.SelectboxColumn(
+            "Type", options=["X", "Y", "X Range", "Y Range", "Point"]
+        ),
         "target_column": st.column_config.SelectboxColumn(
             "Target column", options=[x_col] + y_cols
         ),
         "value": st.column_config.TextColumn("Value"),
+        "value2": st.column_config.TextColumn("Value 2 (range end)"),
+        "label": st.column_config.TextColumn("Label (optional)"),
+        "color": st.column_config.TextColumn(
+            "Color (optional)", help="A CSS color name (e.g. orange) or hex code (e.g. #ff8800)"
+        ),
     },
 )
-st.session_state.marker_table = marker_table.astype(
-    {"type": "string", "target_column": "string", "value": "string"}
+marker_table = marker_table.astype(
+    {
+        "type": "string",
+        "target_column": "string",
+        "value": "string",
+        "value2": "string",
+        "label": "string",
+        "color": "string",
+    }
 )
+
+# Label styling applies to every marker's text uniformly (font/background/
+# position), separately from each row's own line/band color above — kept as
+# one shared style rather than per-row columns so the table doesn't balloon
+# with rarely-changed settings.
+with st.sidebar.expander("Marker label style", expanded=False):
+    label_font_color = st.color_picker("Font color", value="#000000")
+    label_font_size = st.slider("Font size", min_value=8, max_value=32, value=12)
+    style_cols = st.columns(2)
+    label_bold = style_cols[0].checkbox("Bold", value=False)
+    label_italic = style_cols[1].checkbox("Italic", value=False)
+    label_bg_enabled = st.checkbox("Add label background", value=False)
+    label_bg_color = (
+        st.color_picker("Background color", value="#FFFFFF") if label_bg_enabled else None
+    )
+    label_position = st.selectbox(
+        "Label position",
+        ["Auto (per marker type)", "Top left", "Top right", "Bottom left", "Bottom right"],
+    )
+
+
+def _styled_label_text(text: str) -> str:
+    """Wrap in Plotly's supported HTML-like tags — annotation text (unlike
+    plain shape/axis text) renders a small tag subset including <b>/<i>."""
+    if label_bold:
+        text = f"<b>{text}</b>"
+    if label_italic:
+        text = f"<i>{text}</i>"
+    return text
+
+
+def _effective_position(default_position: str) -> str:
+    """X/Y/Range markers all take a Plotly `annotation_position` keyword, but
+    the valid set differs by orientation (vline/vrect accept top/bottom
+    variants, hline/hrect accept left/right variants) — "top left", "top
+    right", "bottom left", "bottom right" is the intersection valid for both,
+    which is exactly the choice list offered above, so any selection can be
+    passed straight through regardless of which of the four marker kinds it
+    lands on."""
+    if label_position == "Auto (per marker type)":
+        return default_position
+    return label_position.lower()
+
+
+# Point markers use add_annotation's pixel arrow offset (ax/ay), not the
+# annotation_position keyword the other four types use, so "position" maps to
+# a direction to nudge the label away from the actual data point instead.
+POINT_POSITION_OFFSETS = {
+    "Auto (per marker type)": (0, -35),
+    "Top left": (-40, -35),
+    "Top right": (40, -35),
+    "Bottom left": (-40, 35),
+    "Bottom right": (40, 35),
+}
 
 
 def format_value_like(series: pd.Series, value: float) -> str:
@@ -363,9 +471,13 @@ if supports_range:
         if min_x < max_x:
             range_key = f"range_{x_col}"
             _sticky_range(range_key, min_x, max_x)
+            # Streamlit's default slider label for a datetime value is date-only
+            # ("YYYY-MM-DD") — fine for data spanning weeks, useless for a few
+            # hours of SCADA data where every handle looks like it's at the same
+            # spot. format= must be passed explicitly to also show the time.
             sel_range = st.slider(
                 "Show data between", min_value=min_x, max_value=max_x, key=range_key,
-                step=_infer_step(df[x_col]),
+                step=_infer_step(df[x_col]), format="YYYY-MM-DD HH:mm:ss",
             )
             view_df = df[(df[x_col] >= sel_range[0]) & (df[x_col] <= sel_range[1])]
     elif x_col in numeric_cols:
@@ -455,10 +567,10 @@ if log_y and chart_type not in ("Pie", "Heatmap"):
 # out the pixel offsets itself, which is far more robust than hand-computing
 # paper-coordinate positions per axis.
 # ---------------------------------------------------------------------------
-def _make_axis(color: str | None, overlaying: bool, side: str) -> dict:
+def _make_axis(color: str | None, overlaying: bool, side: str, show_grid: bool) -> dict:
     style = dict(
         tickfont=dict(color=color) if color else {},
-        showgrid=False,
+        showgrid=show_grid,
         side=side,
         automargin=True,
     )
@@ -478,43 +590,133 @@ if supports_multi_y and y_cols:
     sides = ["left", "right"]
     for i, y in enumerate(y_cols):
         color = None if color_col else y_color_map[y]
-        style = _make_axis(color, overlaying=i > 0, side=sides[i % 2])
+        style = _make_axis(color, overlaying=i > 0, side=sides[i % 2], show_grid=show_grid)
         fig.update_layout(**{y_layout_keys[y]: style})
 
+def _parse_x_value(raw):
+    """Parse a marker's Value/Value 2 field the same way the X column itself
+    is typed — a date when X is a datetime column, else a plain float."""
+    return pd.to_datetime(raw) if x_col in datetime_cols else float(raw)
+
+
+def _clean(raw) -> str | None:
+    """pd.isna() must run before any truthiness check on `raw` — a freshly
+    added, not-yet-filled-in marker row's cells come through as pd.NA (the
+    nullable "string" dtype's missing value), and `if raw` on a bare pd.NA
+    raises "TypeError: boolean value of NA is ambiguous" before the isna()
+    check ever gets a chance to short-circuit it."""
+    if pd.isna(raw):
+        return None
+    return raw if raw else None
+
+
 # ---------------------------------------------------------------------------
-# Reference markers, formatted to match the data they point at
+# Reference markers, formatted to match the data they point at. Five kinds:
+# X / Y single dashed lines, X Range / Y Range shaded bands between two
+# values (e.g. a frequency deadband), and Point which labels the actual data
+# point nearest a given X on a chosen series' line.
 # ---------------------------------------------------------------------------
 if chart_type not in ("Pie", "Heatmap") and not marker_table.empty:
     for _, row in marker_table.iterrows():
         mtype = row.get("type")
         target = row.get("target_column")
         raw_value = row.get("value")
-        if not mtype or pd.isna(raw_value) or raw_value in (None, ""):
+        raw_value2 = row.get("value2")
+        custom_label = _clean(row.get("label"))
+        row_color = _clean(row.get("color"))
+        if pd.isna(mtype) or not mtype or pd.isna(raw_value) or raw_value in (None, ""):
             continue
         try:
             if mtype == "X":
-                if x_col in datetime_cols:
-                    parsed = pd.to_datetime(raw_value)
-                    label = format_datetime_like(df[x_col], parsed)
-                else:
-                    parsed = float(raw_value)
-                    label = format_value_like(df[x_col], parsed) if x_col in numeric_cols else str(parsed)
+                parsed = _parse_x_value(raw_value)
+                label = custom_label or (
+                    format_datetime_like(df[x_col], parsed)
+                    if x_col in datetime_cols
+                    else (format_value_like(df[x_col], parsed) if x_col in numeric_cols else str(parsed))
+                )
                 fig.add_vline(
-                    x=_shape_safe(parsed), line_dash="dash", line_color="red",
-                    annotation_text=label, annotation_position="top",
+                    x=_shape_safe(parsed), line_dash="dash", line_color=row_color or "red",
+                    annotation_text=_styled_label_text(label),
+                    annotation_position=_effective_position("top"),
+                    annotation_font_color=label_font_color, annotation_font_size=label_font_size,
+                    annotation_bgcolor=label_bg_color,
                 )
             elif mtype == "Y":
                 value = float(raw_value)
                 ref_col = target if target in df.columns else (y_cols[0] if y_cols else None)
-                label = format_value_like(df[ref_col], value) if ref_col else str(value)
+                label = custom_label or (
+                    f"{ref_col}: {format_value_like(df[ref_col], value)}" if ref_col else str(value)
+                )
                 yaxis_ref = y_axis_ids.get(ref_col, "y")
                 fig.add_hline(
-                    y=value, line_dash="dash", line_color="green",
-                    annotation_text=f"{ref_col}: {label}" if ref_col else label,
-                    annotation_position="right",
+                    y=value, line_dash="dash", line_color=row_color or "green",
+                    annotation_text=_styled_label_text(label),
+                    annotation_position=_effective_position("right"),
+                    annotation_font_color=label_font_color, annotation_font_size=label_font_size,
+                    annotation_bgcolor=label_bg_color,
                     yref=yaxis_ref,
                 )
-        except (ValueError, TypeError):
+            elif mtype == "X Range":
+                raw_value2 = _clean(raw_value2)
+                if raw_value2 is None:
+                    continue
+                x0, x1 = sorted([_parse_x_value(raw_value), _parse_x_value(raw_value2)])
+                fig.add_vrect(
+                    x0=_shape_safe(x0), x1=_shape_safe(x1),
+                    fillcolor=row_color or "red", opacity=0.1, line_width=0,
+                    annotation_text=_styled_label_text(custom_label or "Range"),
+                    annotation_position=_effective_position("top left"),
+                    annotation_font_color=label_font_color, annotation_font_size=label_font_size,
+                    annotation_bgcolor=label_bg_color,
+                )
+            elif mtype == "Y Range":
+                raw_value2 = _clean(raw_value2)
+                if raw_value2 is None:
+                    continue
+                y0, y1 = sorted([float(raw_value), float(raw_value2)])
+                ref_col = target if target in df.columns else (y_cols[0] if y_cols else None)
+                yaxis_ref = y_axis_ids.get(ref_col, "y")
+                label = custom_label or (f"{ref_col} band" if ref_col else "Band")
+                fig.add_hrect(
+                    y0=y0, y1=y1, yref=yaxis_ref,
+                    fillcolor=row_color or "green", opacity=0.12, line_width=0,
+                    annotation_text=_styled_label_text(label),
+                    annotation_position=_effective_position("right"),
+                    annotation_font_color=label_font_color, annotation_font_size=label_font_size,
+                    annotation_bgcolor=label_bg_color,
+                )
+            elif mtype == "Point":
+                ref_col = target if target in y_cols else (y_cols[0] if y_cols else None)
+                if not ref_col:
+                    continue
+                x_target = _parse_x_value(raw_value)
+                if x_col in datetime_cols:
+                    idx = (view_df[x_col] - pd.Timestamp(x_target)).abs().idxmin()
+                else:
+                    idx = (view_df[x_col] - x_target).abs().idxmin()
+                point_row = view_df.loc[idx]
+                actual_x, actual_y = point_row[x_col], point_row[ref_col]
+                if pd.isna(actual_y):
+                    continue
+                label = custom_label or format_value_like(df[ref_col], actual_y)
+                yaxis_ref = y_axis_ids.get(ref_col, "y")
+                point_color = row_color or (y_color_map.get(ref_col, "black") if not color_col else "black")
+                ax, ay = POINT_POSITION_OFFSETS.get(label_position, (0, -35))
+                fig.add_annotation(
+                    x=_shape_safe(actual_x), y=actual_y, yref=yaxis_ref,
+                    text=_styled_label_text(label), showarrow=True, arrowhead=2, ax=ax, ay=ay,
+                    font=dict(color=label_font_color, size=label_font_size),
+                    bgcolor=label_bg_color if label_bg_enabled else "white",
+                    bordercolor=point_color,
+                )
+                fig.add_trace(
+                    go.Scatter(
+                        x=[actual_x], y=[actual_y], yaxis=yaxis_ref, mode="markers",
+                        marker=dict(size=10, color=point_color, line=dict(width=1, color="white")),
+                        showlegend=False, hoverinfo="skip",
+                    )
+                )
+        except (ValueError, TypeError, KeyError):
             continue
 
 fig.update_layout(
@@ -531,12 +733,19 @@ if show_spikes and chart_type not in ("Pie", "Heatmap"):
     fig.update_xaxes(showspikes=True, spikemode="across", spikedash="dot", spikethickness=1)
     fig.update_yaxes(showspikes=True, spikemode="across", spikedash="dot", spikethickness=1)
 
+if chart_type not in ("Pie", "Heatmap"):
+    # Blanket pass covering chart types (Histogram, Box, single-axis Bar) that
+    # skip the per-column _make_axis wiring above and so never got a showgrid
+    # value at all; harmlessly reapplies the same value for the ones that did.
+    fig.update_xaxes(showgrid=show_grid)
+    fig.update_yaxes(showgrid=show_grid)
+
 # ---------------------------------------------------------------------------
 # Movable cursor: drag a slider along X and read off every trend's value
 # at that point (snapped to the nearest actual row).
 # ---------------------------------------------------------------------------
 cursor_row = None
-if chart_type in ("Line", "Scatter", "Bar") and y_cols and len(view_df) > 0:
+if show_cursor and chart_type in ("Line", "Scatter", "Bar") and y_cols and len(view_df) > 0:
     st.subheader("Cursor")
     if x_col in datetime_cols:
         min_x, max_x = view_df[x_col].min().to_pydatetime(), view_df[x_col].max().to_pydatetime()
@@ -545,7 +754,7 @@ if chart_type in ("Line", "Scatter", "Bar") and y_cols and len(view_df) > 0:
             _sticky_value(cursor_key, min_x, max_x, min_x)
             cursor_val = st.slider(
                 "Position (X)", min_value=min_x, max_value=max_x, key=cursor_key,
-                step=_infer_step(view_df[x_col]),
+                step=_infer_step(view_df[x_col]), format="YYYY-MM-DD HH:mm:ss",
             )
             idx = (view_df[x_col] - pd.Timestamp(cursor_val)).abs().idxmin()
             cursor_row = view_df.loc[idx]
@@ -583,8 +792,9 @@ if chart_type in ("Line", "Scatter", "Bar") and y_cols and len(view_df) > 0:
 
 # ---------------------------------------------------------------------------
 # One stats table for the data currently shown, with a "Current" column
-# holding the cursor's reading when a cursor is active (blank otherwise, e.g.
-# for Histogram/Box/Pie/Heatmap, which have no cursor). SCADA column names
+# holding the cursor's reading when a cursor is active (blank otherwise —
+# either "Show cursor" is off, or the chart type has no cursor at all, e.g.
+# Histogram/Box/Pie/Heatmap). SCADA column names
 # are often long ("SwYrd Frequency BUS 1 (Hz)"), so this stays a table with
 # one row per series rather than tiles/metrics that would truncate them.
 # Shown right below the cursor slider, above the plot, so the reading is the

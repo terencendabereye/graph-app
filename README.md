@@ -64,12 +64,16 @@ for the check to pass without bundling the full package again.
 
 The script runs top to bottom on every rerun:
 
-1. **Data loading** — file upload (CSV/Excel) → cached read → stored in
-   `st.session_state.df` so edits persist across reruns without re-uploading.
-   Every text column (regardless of its name) is tried as a date/time during
-   load — SCADA exports often label a time-of-day column with something
-   generic (e.g. a column called "Point Name" holding `"03:00:00"`), so a
-   name-based filter alone would miss real cases.
+1. **Data loading** — file upload (CSV/Excel, `accept_multiple_files=True`) →
+   cached read per file → stored in `st.session_state.df` so edits persist
+   across reruns without re-uploading. Multiple files are concatenated by
+   row (not replaced) and, if any column parsed as a datetime, sorted by it —
+   this is for SCADA/historian exports that arrive as several files covering
+   different time windows for the same tags. Every text column (regardless
+   of its name) is tried as a date/time during load — SCADA exports often
+   label a time-of-day column with something generic (e.g. a column called
+   "Point Name" holding `"03:00:00"`), so a name-based filter alone would
+   miss real cases.
 2. **Data editing** — an expander for renaming columns and editing/adding/
    deleting rows via `st.data_editor`. Writes back into `st.session_state.df`.
 3. **Chart configuration** (sidebar) — chart type, X/Y column pickers
@@ -121,12 +125,21 @@ The script runs top to bottom on every rerun:
   `add_vline` call. If you add another shape/annotation using a value pulled
   from a datetime column, run it through `_shape_safe()` too.
 - **Reference markers** (`marker_table`) are stored as an explicitly
-  string-typed 3-column DataFrame (`type`, `target_column`, `value`).
-  This is required, not optional — `st.data_editor` cross-checks each
-  column's `column_config` type against the DataFrame's own inferred dtype,
-  and an empty numeric-looking column configured as a `TextColumn` throws
-  `StreamlitAPIException`. Keep new columns in this table string-typed and
-  re-cast after every edit if you extend it.
+  string-typed 5-column DataFrame (`type`, `target_column`, `value`,
+  `value2`, `label`). This is required, not optional — `st.data_editor`
+  cross-checks each column's `column_config` type against the DataFrame's
+  own inferred dtype, and an empty numeric-looking column configured as a
+  `TextColumn` throws `StreamlitAPIException`. Keep new columns in this
+  table string-typed and re-cast after every edit if you extend it.
+  Five marker `type`s: `X`/`Y` (a single dashed line via `add_vline`/
+  `add_hline`), `X Range`/`Y Range` (a shaded band between `value` and
+  `value2` via `add_vrect`/`add_hrect` — e.g. a frequency deadband),
+  and `Point` (labels the actual data row nearest `value` on
+  `target_column`'s line — snaps to `view_df` the same way the cursor
+  does, then draws a `go.Scatter` marker + `add_annotation` with an
+  arrow at that row's real x/y, not the raw typed-in value).
+  `label` is optional on every type; blank falls back to an
+  auto-generated label from `format_value_like`/`format_datetime_like`.
 - **Cursor line** (`add_vline`) is only drawn when X is numeric or datetime.
   Plotly's shape-annotation math for `add_vline`/`add_hline` breaks on
   categorical X axes (throws `TypeError: unsupported operand type(s) for

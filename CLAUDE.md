@@ -60,10 +60,15 @@ want it auto-detected going forward), then re-run `.\build.ps1`.
 
 ### `graph_app.py` execution phases (top to bottom, every rerun)
 
-1. **Data loading** — file upload → `@st.cache_data`-cached read → stored in
-   `st.session_state.df` so edits/renames persist across reruns without re-uploading. Every text
-   column (CSV *or* Excel) is run through `_parse_likely_dates`, which tries `pd.to_datetime` on
-   it regardless of column name and keeps the conversion if ≥90% parses cleanly.
+1. **Data loading** — file upload (`accept_multiple_files=True`) → each file's read is
+   `@st.cache_data`-cached individually → stored in `st.session_state.df` so edits/renames persist
+   across reruns without re-uploading. More than one file is `pd.concat`-ed by row (not
+   replaced — the old single-file behavior overwrote the previous upload, which is exactly the
+   bug this fixed) and, if any resulting column is a datetime dtype, sorted by the first one, so
+   several historian exports covering different time windows for the same tags land in one
+   chronological series regardless of upload order. Every text column (CSV *or* Excel) is run
+   through `_parse_likely_dates`, which tries `pd.to_datetime` on it regardless of column name and
+   keeps the conversion if ≥90% parses cleanly.
 2. **Data editing** — expander for renaming columns and editing/adding/deleting rows via
    `st.data_editor`, written back into `st.session_state.df`.
 3. **Chart configuration** (sidebar) — chart type, X/Y pickers (Y defaults to the first 3 numeric
@@ -100,16 +105,36 @@ want it auto-detected going forward), then re-run `.\build.ps1`.
   day, which for SCADA data sampled every second or so meant the slider could only ever reach a
   couple of positions across an hour of data — looked like it was "jumping" instead of moving
   smoothly.
+- **Both datetime sliders pass `format="YYYY-MM-DD HH:mm:ss"` explicitly.** Streamlit's own
+  default label for a `datetime` slider is date-only, so a data window of a few hours showed the
+  same date on both handles with no way to tell them apart. Numeric-X sliders don't take this
+  format string (it's date-format syntax, meaningless for a plain float) — only the two
+  `x_col in datetime_cols` branches (data-window range slider, cursor slider) need it.
 - **`pd.Timestamp` scalars break Kaleido's PNG export** (`Type is not JSON serializable`) when
   passed to `add_vline`/`add_hline`, even though the same type inside a trace's actual array data
   is fine — Kaleido (PNG rendering) uses a stricter JSON encoder than the rest of Plotly for
   shapes specifically. `_shape_safe()` converts to a plain `datetime` first; both `add_vline` call
   sites (cursor line, X-type reference marker) go through it. Route any new datetime-valued
   shape/annotation through it too.
-- **`marker_table`** (reference markers) must stay an explicitly string-typed 3-column DataFrame
-  (`type`, `target_column`, `value`) — `st.data_editor`'s `column_config` type is cross-checked
-  against the DataFrame's own inferred dtype, and an empty numeric-looking column configured as a
-  `TextColumn` throws `StreamlitAPIException`. Re-cast to string after every edit if extended.
+- **`st.session_state.marker_table` is seeded once and never reassigned** — same principle as
+  `_sticky_range`/`_sticky_value` above, but for `data_editor` instead of `slider`. An earlier
+  version fed the edited/cast output back into `st.session_state.marker_table`, which is what
+  `data_editor(..., key="marker_editor")` reads as its `data=` argument on the next rerun; since
+  `data_editor` already persists its own edits across reruns internally via that `key`, feeding
+  its output back in fought that internal diff tracking — a freshly typed cell got reverted and
+  had to be entered twice before it stuck. The `.astype(...)` cast for downstream use must be
+  assigned to a local (`marker_table = marker_table.astype(...)`), not written back to session
+  state.
+- **`marker_table`** (reference markers) must stay an explicitly string-typed DataFrame (`type`,
+  `target_column`, `value`, `value2`, `label`) — `st.data_editor`'s `column_config` type is
+  cross-checked against the DataFrame's own inferred dtype, and an empty numeric-looking column
+  configured as a `TextColumn` throws `StreamlitAPIException`. Re-cast to string after every edit
+  if extended further. Five `type`s: `X`/`Y` single dashed lines, `X Range`/`Y Range` shaded bands
+  (`add_vrect`/`add_hrect`) between `value` and `value2` — the deadband use case — and `Point`,
+  which does **not** plot the typed-in value directly: it looks up the nearest row to `value` in
+  `view_df` (same nearest-row snap as the cursor slider) and labels that row's actual x/y, so the
+  label always matches a real sample. `label` is optional everywhere; blank uses the same
+  `format_value_like`/`format_datetime_like` auto-formatting as `X`/`Y` markers.
 - **Cursor line** (`add_vline`) is only drawn when X is numeric or datetime — Plotly's
   shape-annotation math breaks on categorical X (`TypeError` averaging two category labels). For
   categorical X the app uses a `select_slider` over the distinct category strings and shows the
